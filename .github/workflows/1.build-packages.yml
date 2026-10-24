@@ -3,18 +3,19 @@ name: Build adw-gtk3 RPM and DEB
 
 on:
   schedule:
-    # 每天 UTC 02:30 检查，即北京时间 10:30
+    # Daily at 10:30 Beijing time (02:30 UTC)
     - cron: "30 2 * * *"
+
   workflow_dispatch:
     inputs:
       force_rebuild:
-        description: "Force rebuild even if this release was already built"
-        required: true
+        description: "Rebuild and replace assets for an existing release"
         type: boolean
+        required: true
         default: false
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: adw-gtk3-packages
@@ -28,114 +29,131 @@ jobs:
     steps:
       - name: Install packaging tools
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            curl jq git meson ninja-build \
-            rpm dpkg-dev fakeroot \
-            build-essential
+            curl jq tar xz-utils \
+            dpkg-dev fakeroot \
+            rpm
 
       - name: Get latest upstream release
         id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
 
-          release_json="$(curl -fsSL \
+          curl -fsSL --retry 3 \
             -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/lassekongo83/adw-gtk3/releases/latest)"
+            https://api.github.com/repos/lassekongo83/adw-gtk3/releases/latest \
+            -o release.json
 
-          tag="$(jq -er '.tag_name' <<< "$release_json")"
+          tag="$(jq -er '.tag_name' release.json)"
           version="${tag#v}"
 
-          # Only accept ordinary numeric release versions.
-          [[ "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]] || {
-            echo "Unsupported release tag: $tag"
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "Unsupported release version: $tag"
             exit 1
-          }
+          fi
+
+          # Select the upstream prebuilt theme archive.
+          url="$(jq -er '
+            [.assets[]
+              | select(.name | test("^adw-gtk3v[0-9].*\\.tar\\.xz$"))]
+            | first
+            | .browser_download_url
+          ' release.json)"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
 
-          echo "Latest release: $tag"
+          echo "Upstream release: $tag"
+          echo "Archive: $url"
 
-      - name: Skip previously built release
+      - name: Check existing published release
         id: check
-        if: github.event_name == 'schedule' || !inputs.force_rebuild
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
+          FORCE: ${{ inputs.force_rebuild }}
+          EVENT: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # Search successful workflow runs for this version.
-          runs="$(curl -fsSL \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$REPOSITORY/actions/workflows/1.build-packages.yml/runs?status=success&per_page=100")"
-
-          if jq -e --arg version "$VERSION" \
-            '.workflow_runs[] |
-             select(.head_branch == "main") |
-             select(.display_title == ("Build adw-gtk3 RPM and DEB"))' \
-            <<< "$runs" >/dev/null; then
-            # Check the successful run's artifacts for the version.
-            while IFS= read -r run_id; do
-              artifacts="$(curl -fsSL \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                "https://api.github.com/repos/$REPOSITORY/actions/runs/$run_id/artifacts")"
-
-              if jq -e --arg version "$VERSION" \
-                '.artifacts[] | select(.name == ("adw-gtk3-" + $version))' \
-                <<< "$artifacts" >/dev/null; then
-                echo "skip=true" >> "$GITHUB_OUTPUT"
-                echo "Version $VERSION already has a successful artifact."
-                exit 0
-              fi
-            done < <(jq -r '.workflow_runs[].id' <<< "$runs")
-          fi
-
+          release_tag="adw-gtk3-${TAG}"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Download upstream release source
+          if [[ "$EVENT" == "workflow_dispatch" &&
+                "$FORCE" == "true" ]]; then
+            echo "Forced rebuild requested."
+            exit 0
+          fi
+
+          if ! gh release view "$release_tag" \
+              --repo "$REPOSITORY" >/dev/null 2>&1; then
+            echo "No published release for $VERSION."
+            exit 0
+          fi
+
+          assets="$(gh release view "$release_tag" \
+            --repo "$REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+
+          if grep -Fxq \
+              "adw-gtk3-theme-${VERSION}-1.noarch.rpm" <<< "$assets" &&
+             grep -Fxq \
+              "adw-gtk3-theme_${VERSION}-1_all.deb" <<< "$assets"; then
+            echo "Version $VERSION is already published."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Existing release is incomplete; rebuilding."
+          fi
+
+      - name: Download upstream release
         if: steps.check.outputs.skip != 'true'
         env:
+          URL: ${{ steps.release.outputs.url }}
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
 
+          mkdir -p work/source work/payload dist
+
+          curl -fL --retry 3 "$URL" -o work/upstream.tar.xz
+          tar -tJf work/upstream.tar.xz >/dev/null
+          tar -xJf work/upstream.tar.xz -C work/source
+
+          # Find the actual theme directories in the release archive.
+          for theme in adw-gtk3 adw-gtk3-dark; do
+            src="$(find work/source -type d \
+              -name "$theme" -print -quit)"
+
+            if [[ -z "$src" || ! -d "$src/gtk-3.0" ]]; then
+              echo "Missing or invalid theme directory: $theme"
+              find work/source -maxdepth 4 -type d
+              exit 1
+            fi
+
+            mkdir -p "work/payload/usr/share/themes"
+            cp -a "$src" "work/payload/usr/share/themes/"
+          done
+
+          # Fetch the matching upstream license.
           curl -fL --retry 3 \
-            "https://github.com/lassekongo83/adw-gtk3/archive/refs/tags/${TAG}.tar.gz" \
-            -o upstream.tar.gz
+            "https://raw.githubusercontent.com/lassekongo83/adw-gtk3/${TAG}/LICENSE" \
+            -o work/LICENSE
 
-          mkdir upstream
-          tar -xzf upstream.tar.gz \
-            --strip-components=1 -C upstream
+          mkdir -p \
+            work/payload/usr/share/licenses/adw-gtk3-theme
 
-          test -f upstream/meson.build
-          test -f upstream/LICENSE
+          cp work/LICENSE \
+            work/payload/usr/share/licenses/adw-gtk3-theme/LICENSE
 
-      - name: Build installation tree
-        if: steps.check.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          meson setup upstream/build upstream \
-            --prefix=/usr \
-            --buildtype=release
-
-          DESTDIR="$GITHUB_WORKSPACE/stage" \
-            meson install -C upstream/build
-
-          test -d stage/usr/share/themes
-          find stage/usr/share/themes -maxdepth 2 -type f | head -50
+          echo "Packaged theme directories:"
+          find work/payload/usr/share/themes -maxdepth 2 -type d
 
       - name: Build DEB package
         if: steps.check.outputs.skip != 'true'
@@ -144,77 +162,104 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p packages/deb/DEBIAN
-          cp -a stage/usr packages/deb/
+          pkg="work/deb"
+          mkdir -p "$pkg/DEBIAN"
 
-          cat > packages/deb/DEBIAN/control <<EOF
+          cp -a work/payload/usr "$pkg/"
+
+          cat > "$pkg/DEBIAN/control" <<EOF
           Package: adw-gtk3-theme
           Version: ${VERSION}-1
           Section: gnome
           Priority: optional
           Architecture: all
-          Maintainer: GitHub Actions Builder
-          Depends: 
+          Maintainer: Automated Package Builder
           Description: GTK3 theme matching GNOME libadwaita
            An unofficial GTK3 port of the libadwaita theme.
           EOF
 
-          mkdir -p dist
-          dpkg-deb --root-owner-group \
-            --build packages/deb \
+          dpkg-deb --root-owner-group --build \
+            "$pkg" \
             "dist/adw-gtk3-theme_${VERSION}-1_all.deb"
 
       - name: Build RPM package
         if: steps.check.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p ~/rpmbuild/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-          cp -a stage/usr ~/rpmbuild/SOURCES/payload-usr
+          top="$RUNNER_TEMP/rpmbuild"
+          mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 
-          cat > ~/rpmbuild/SPECS/adw-gtk3-theme.spec <<EOF
+          tar -czf "$top/SOURCES/payload.tar.gz" \
+            -C work/payload .
+
+          cat > "$top/SPECS/adw-gtk3-theme.spec" <<EOF
           Name:           adw-gtk3-theme
           Version:        ${VERSION}
           Release:        1
           Summary:        GTK3 theme matching GNOME libadwaita
           License:        LGPL-2.1-only
           BuildArch:      noarch
-          Source0:        payload-usr
+          Source0:        payload.tar.gz
 
           %description
           An unofficial GTK3 port of the libadwaita theme.
 
+          %prep
+
+          %build
+
           %install
-          mkdir -p %{buildroot}/usr
-          cp -a %{_sourcedir}/payload-usr/. %{buildroot}/usr/
+          mkdir -p %{buildroot}
+          tar -xzf %{SOURCE0} -C %{buildroot}
 
           %files
-          /usr/share/themes/*
+          %license /usr/share/licenses/adw-gtk3-theme/LICENSE
+          /usr/share/themes/adw-gtk3
+          /usr/share/themes/adw-gtk3-dark
 
           %changelog
-          * $(date '+%a %b %d %Y') GitHub Actions Builder <noreply@example.com> - ${VERSION}-1
+          * Sat Oct 24 2026 Automated Package Builder <noreply@example.com> - ${VERSION}-1
           - Automated upstream release package
           EOF
 
-          rpmbuild -bb ~/rpmbuild/SPECS/adw-gtk3-theme.spec
+          rpmbuild -bb \
+            --define "_topdir $top" \
+            "$top/SPECS/adw-gtk3-theme.spec"
 
-          find ~/rpmbuild/RPMS -name '*.rpm' \
+          find "$top/RPMS" -type f -name '*.rpm' \
             -exec cp {} dist/ \;
+
+          # Normalize the RPM filename for release uploads.
+          mv "$(find dist -maxdepth 1 -name '*.rpm' -print -quit)" \
+            "dist/adw-gtk3-theme-${VERSION}-1.noarch.rpm"
 
       - name: Validate packages
         if: steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
 
-          dpkg-deb --info dist/*.deb
-          rpm -qpi dist/*.rpm
+          deb="dist/adw-gtk3-theme_${{ steps.release.outputs.version }}-1_all.deb"
+          rpm="dist/adw-gtk3-theme-${{ steps.release.outputs.version }}-1.noarch.rpm"
 
-          test -n "$(find dist -name '*.deb' -print -quit)"
-          test -n "$(find dist -name '*.rpm' -print -quit)"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          rpm -qpi "$rpm"
+          rpm -qlp "$rpm"
 
-      - name: Upload packages
+          # Ensure both themes are present in both packages.
+          for theme in adw-gtk3 adw-gtk3-dark; do
+            dpkg-deb --contents "$deb" |
+              grep -F "usr/share/themes/$theme/gtk-3.0/"
+
+            rpm -qlp "$rpm" |
+              grep -F "/usr/share/themes/$theme/gtk-3.0/"
+          done
+
+      - name: Upload build artifacts
         if: steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -222,3 +267,42 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 90
+
+      - name: Publish GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="adw-gtk3-${TAG}"
+
+          # Create the release if necessary.
+          if ! gh release view "$release_tag" \
+              --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$release_tag" \
+              --repo "$REPOSITORY" \
+              --title "adw-gtk3 ${VERSION} - RPM and DEB" \
+              --notes "Automated RPM and DEB packages for upstream release ${TAG}.
+
+          Upstream: https://github.com/lassekongo83/adw-gtk3/releases/tag/${TAG}
+
+          Packages:
+          - Fedora / AlmaLinux / RPM-based distributions: RPM
+          - Debian / Ubuntu / DEB-based distributions: DEB
+
+          These packages install the adw-gtk3 and adw-gtk3-dark theme directories." \
+              --target "$GITHUB_SHA"
+          fi
+
+          # Upload or replace the package assets.
+          gh release upload "$release_tag" \
+            dist/*.rpm dist/*.deb \
+            --repo "$REPOSITORY" \
+            --clobber
+
+          echo "Published release: $release_tag"
