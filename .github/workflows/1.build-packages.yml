@@ -33,8 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             curl jq tar xz-utils \
-            dpkg-dev fakeroot \
-            rpm
+            dpkg-dev fakeroot rpm
 
       - name: Get latest upstream release
         id: release
@@ -55,7 +54,7 @@ jobs:
             exit 1
           fi
 
-          # Select the upstream prebuilt theme archive.
+          # Find the upstream prebuilt theme archive.
           url="$(jq -er '
             [.assets[]
               | select(.name | test("^adw-gtk3v[0-9].*\\.tar\\.xz$"))]
@@ -117,6 +116,7 @@ jobs:
         env:
           URL: ${{ steps.release.outputs.url }}
           TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -126,7 +126,6 @@ jobs:
           tar -tJf work/upstream.tar.xz >/dev/null
           tar -xJf work/upstream.tar.xz -C work/source
 
-          # Find the actual theme directories in the release archive.
           for theme in adw-gtk3 adw-gtk3-dark; do
             src="$(find work/source -type d \
               -name "$theme" -print -quit)"
@@ -137,11 +136,10 @@ jobs:
               exit 1
             fi
 
-            mkdir -p "work/payload/usr/share/themes"
-            cp -a "$src" "work/payload/usr/share/themes/"
+            mkdir -p work/payload/usr/share/themes
+            cp -a "$src" work/payload/usr/share/themes/
           done
 
-          # Fetch the matching upstream license.
           curl -fL --retry 3 \
             "https://raw.githubusercontent.com/lassekongo83/adw-gtk3/${TAG}/LICENSE" \
             -o work/LICENSE
@@ -159,6 +157,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         env:
           VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -230,27 +229,43 @@ jobs:
             --define "_topdir $top" \
             "$top/SPECS/adw-gtk3-theme.spec"
 
-          find "$top/RPMS" -type f -name '*.rpm' \
-            -exec cp {} dist/ \;
+          rpm_file="$(find "$top/RPMS" -type f \
+            -name '*.rpm' -print -quit)"
 
-          # Normalize the RPM filename for release uploads.
-          mv "$(find dist -maxdepth 1 -name '*.rpm' -print -quit)" \
-            "dist/adw-gtk3-theme-${VERSION}-1.noarch.rpm"
+          if [[ -z "$rpm_file" ]]; then
+            echo "ERROR: RPM package not found"
+            exit 1
+          fi
+
+          target="dist/adw-gtk3-theme-${VERSION}-1.noarch.rpm"
+
+          # Copy only when the source and target differ.
+          if [[ "$rpm_file" != "$target" ]]; then
+            cp "$rpm_file" "$target"
+          fi
+
+          test -f "$target"
+          echo "Built RPM: $target"
 
       - name: Validate packages
         if: steps.check.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          deb="dist/adw-gtk3-theme_${{ steps.release.outputs.version }}-1_all.deb"
-          rpm="dist/adw-gtk3-theme-${{ steps.release.outputs.version }}-1.noarch.rpm"
+          deb="dist/adw-gtk3-theme_${VERSION}-1_all.deb"
+          rpm="dist/adw-gtk3-theme-${VERSION}-1.noarch.rpm"
+
+          test -s "$deb"
+          test -s "$rpm"
 
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
           rpm -qpi "$rpm"
           rpm -qlp "$rpm"
 
-          # Ensure both themes are present in both packages.
           for theme in adw-gtk3 adw-gtk3-dark; do
             dpkg-deb --contents "$deb" |
               grep -F "usr/share/themes/$theme/gtk-3.0/"
@@ -258,6 +273,8 @@ jobs:
             rpm -qlp "$rpm" |
               grep -F "/usr/share/themes/$theme/gtk-3.0/"
           done
+
+          echo "Both packages validated successfully."
 
       - name: Upload build artifacts
         if: steps.check.outputs.skip != 'true'
@@ -281,7 +298,6 @@ jobs:
 
           release_tag="adw-gtk3-${TAG}"
 
-          # Create the release if necessary.
           if ! gh release view "$release_tag" \
               --repo "$REPOSITORY" >/dev/null 2>&1; then
             gh release create "$release_tag" \
@@ -292,14 +308,13 @@ jobs:
           Upstream: https://github.com/lassekongo83/adw-gtk3/releases/tag/${TAG}
 
           Packages:
-          - Fedora / AlmaLinux / RPM-based distributions: RPM
-          - Debian / Ubuntu / DEB-based distributions: DEB
+          - RPM: Fedora, AlmaLinux and other RPM-based distributions
+          - DEB: Debian, Ubuntu and other DEB-based distributions
 
-          These packages install the adw-gtk3 and adw-gtk3-dark theme directories." \
+          Installs the adw-gtk3 and adw-gtk3-dark theme directories." \
               --target "$GITHUB_SHA"
           fi
 
-          # Upload or replace the package assets.
           gh release upload "$release_tag" \
             dist/*.rpm dist/*.deb \
             --repo "$REPOSITORY" \
